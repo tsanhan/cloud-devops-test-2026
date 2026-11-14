@@ -1,0 +1,104 @@
+# Azure DevOps Server 2022 example.
+# Configure the `gcp-production` variable group and the `production` environment
+# in Azure DevOps before running this pipeline. See SOLUTION.md for required RBAC.
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  - group: gcp-production # gcpProjectId must be defined in this secured variable group
+  - name: gcpRegion
+    value: me-west1
+  - name: artifactRepository
+    value: survey
+  - name: imageName
+    value: api
+  - name: imageUri
+    value: $(gcpRegion)-docker.pkg.dev/$(gcpProjectId)/$(artifactRepository)/$(imageName)
+
+stages:
+  - stage: BuildAndValidate
+    displayName: Build, test and publish immutable image
+    jobs:
+      - job: Build
+        pool:
+          name: linux-gcp-agent
+        steps:
+          - checkout: self
+            clean: true
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              python -m pytest -q
+            displayName: Run unit tests
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $IMAGE_URI = "$(imageUri)"
+              $IMAGE_TAG = "$(Build.SourceVersion)-$(Build.BuildId)"
+
+              # The self-hosted agent must already have gcloud configured to use
+              # a narrowly scoped identity (prefer short-lived credentials).
+              & gcloud auth configure-docker "$(gcpRegion)-docker.pkg.dev" --quiet
+              & docker build --pull -t "$IMAGE_URI:$IMAGE_TAG" .
+              & docker push "$IMAGE_URI:$IMAGE_TAG"
+
+              $DIGEST = & gcloud artifacts docker images describe "$IMAGE_URI:$IMAGE_TAG" --format='value(image_summary.digest)'
+              if (-not $DIGEST) { throw "gcloud image digest is empty" }
+              if ($DIGEST -notmatch '^sha256:') {
+                throw "Unexpected digest: $DIGEST"
+              }
+
+              New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)" | Out-Null
+              [System.IO.File]::WriteAllText("$(Build.ArtifactStagingDirectory)/image-ref.txt", "$IMAGE_URI@$DIGEST`n")
+              [System.IO.File]::WriteAllText(
+                "$(Build.ArtifactStagingDirectory)/release-metadata.txt",
+                @(
+                  "commit=$(Build.SourceVersion)",
+                  "buildId=$(Build.BuildId)",
+                  "image=$IMAGE_URI@$DIGEST"
+                ) -join [Environment]::NewLine + [Environment]::NewLine
+              )
+            displayName: Build, push and capture immutable image digest
+
+          # Azure DevOps Server (on-premises) uses Build Artifacts, not
+          # Pipeline Artifacts. See the note in SOLUTION.md.
+          - task: PublishBuildArtifacts@1
+            displayName: Publish release metadata
+            inputs:
+              PathtoPublish: $(Build.ArtifactStagingDirectory)
+              ArtifactName: release-metadata
+              publishLocation: Container
+
+  - stage: Production
+    displayName: Deploy to production
+    dependsOn: BuildAndValidate
+    condition: succeeded()
+    jobs:
+      - deployment: DeployApi
+        displayName: Deploy API by image digest
+        pool:
+          name: linux-gcp-agent
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@0
+                  displayName: Download release metadata
+                  inputs:
+                    buildType: current
+                    downloadType: single
+                    artifactName: release-metadata
+                    downloadPath: $(System.ArtifactsDirectory)
+
+                - pwsh: |
+                    $ErrorActionPreference = 'Stop'
+                    $IMAGE_REF = (Get-Content -Raw "$(System.ArtifactsDirectory)/release-metadata/image-ref.txt").Trim()
+                    if (-not $IMAGE_REF) { throw "No image reference found in release metadata" }
+
+                    & gcloud container clusters get-credentials "$(gkeCluster)" --region "$(gcpRegion)" --project "$(gcpProjectId)"
+                    & kubectl set image deployment/survey-api api="$IMAGE_REF" -n app
+                    & kubectl rollout status deployment/survey-api -n app --timeout=5m
+                  displayName: Deploy and verify rollout
